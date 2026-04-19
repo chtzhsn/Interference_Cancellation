@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# virtual env ❗最重要
+venv/
+venv_nano/
+
+# datasets
+data/
+*.txt
+
+# logs / outputs
+logs/*
+plots/*
+!logs/.keep
+!plots/.keep
+
+# checkpoints
+*.pt
+*.pth
+*.pkl
+
+# system
+.DS_Store

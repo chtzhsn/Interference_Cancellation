@@ -1,0 +1,225 @@
+import os
+import torch
+import torch.nn.functional as F
+import tiktoken
+import matplotlib.pyplot as plt
+from model import GPTConfig, GPT
+
+# -----------------------------------------------------------------------------
+# 配置與參數設定
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+use_pretrained = True
+
+# 設定編碼器 (GPT-2 使用 tiktoken)
+enc = tiktoken.get_encoding("gpt2")
+encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
+decode = lambda l: enc.decode(l)
+# -----------------------------------------------------------------------------
+
+def get_target_ids(encode, words):
+    return {w: encode(w)[0] for w in words}
+
+# --- 修改：繪圖輔助函式 (新增 chosen_tokens 參數) ---
+def plot_probabilities(prob_history, max_steps, num_layers, title, filename, chosen_tokens):
+    plt.figure(figsize=(15, 6))
+    
+    x_length = max_steps * num_layers
+    x_axis = list(range(x_length))
+    
+    # 畫出每個 target token 的機率線
+    for word, probs in prob_history.items():
+        plt.plot(x_axis, probs, label=f"'{word.strip()}'", linewidth=2)
+        
+    # 加上垂直虛線，用來分隔不同的 Step
+    for step in range(1, max_steps):
+        plt.axvline(x=step * num_layers, color='gray', linestyle='--', alpha=0.5)
+        
+    # 設定 X 軸的標籤 (顯示 Step 區間與該步選出的 Token)
+    tick_locs = [step * num_layers + num_layers//2 for step in range(max_steps)]
+    # 使用換行符號 \n 將 Step 和 Token 分開
+    tick_labels = [f"Step {step+1}\n({t.strip()})" for step, t in enumerate(chosen_tokens)]
+    plt.xticks(tick_locs, tick_labels)
+    
+    plt.xlabel("Timeline (Generation Steps & Layers)")
+    plt.ylabel("Probability")
+    plt.title(title)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    
+    # 儲存並顯示圖片
+    plt.savefig(filename)
+    print(f"\n[圖表已儲存] {filename}")
+
+
+# ====================================================================
+# 1. 實驗組：逐 Token 指令注入 (每步重新餵 Prompt)
+# ====================================================================
+def run_step_by_step_interference_study(model, encode, decode, initial_prompt, max_steps=5, instruction=""):
+    model.eval()
+    current_context = initial_prompt
+    last_chosen_token_str = "None (Initial)" 
+    full_generated_tokens = [] 
+    
+    # 新增：用來收集每一步選出的字串，供畫圖使用
+    chosen_tokens_str = []
+
+    target_ids = get_target_ids(encode, TARGET_WORDS)
+    prob_history = {word: [] for word in TARGET_WORDS}
+
+    label = "【實驗組：有指令】" if instruction else "【實驗組：無指令】"
+    print(f"\n{'='*90}")
+    print(f"{label} - 自回歸生成與干擾分析")
+    print(f"{'='*90}")
+
+    for step in range(max_steps):
+        full_input_str = f"{instruction}\nContext: {current_context}" if instruction else current_context 
+
+        print(f"\n[Step {step+1}]")
+        print(f"當前完整 Prompt 內容:\n{'-'*50}\n{full_input_str[-100:]} (僅顯示結尾...)\n{'-'*50}")
+        print(f"上一個輸出的字 (當前干擾源): '{last_chosen_token_str}'")
+
+        input_idx = torch.tensor(encode(full_input_str), dtype=torch.long, device=device).unsqueeze(0)
+        
+        with torch.no_grad():
+            _, _, all_layers_logits = model(input_idx, return_all_logits=True)
+            
+        print(f"\n{'層數':<6} | {'Top 5 Tokens & Probabilities':<50} | {'目標詞機率 (Targets)'}")
+        print("-" * 110)
+        
+        for layer_idx, layer_logits in enumerate(all_layers_logits):
+            logits = layer_logits[:, -1, :] if layer_logits.dim() == 3 else layer_logits[-1, :].unsqueeze(0)
+            probs = F.softmax(logits, dim=-1) 
+            top_probs, top_indices = torch.topk(probs[0], 5)
+            
+            top_info = []
+            for p, idx in zip(top_probs, top_indices):
+                t_str = decode([idx.item()]).replace('\n', ' ')
+                top_info.append(f"'{t_str}': {p.item():.4f}")
+                
+            target_probs_str = ", ".join([f"'{k.strip()}': {probs[0, v].item():.4f}" for k, v in target_ids.items()])
+            print(f"L{layer_idx+1:<5} | {', '.join(top_info):<50} | {target_probs_str}")
+
+            for word, t_id in target_ids.items():
+                prob_history[word].append(probs[0, t_id].item())
+            
+            if layer_idx == 11: 
+                next_token_id = top_indices[0].item()
+
+        next_chosen_word = decode([next_token_id])
+        print(f"\n>>> 本輪決策結果 (Next Chosen Word): '{next_chosen_word}'")
+        
+        current_context += next_chosen_word
+        last_chosen_token_str = next_chosen_word
+        full_generated_tokens.append(next_token_id)
+        chosen_tokens_str.append(next_chosen_word) # 紀錄該步決策字串
+        
+    print(f"\n[實驗組結束] 模型生成的完整內容：{decode(full_generated_tokens)}")
+    
+    plot_title = "Experimental Group: Target Token Probabilities (Per Layer & Step)"
+    plot_probabilities(prob_history, max_steps, len(all_layers_logits), plot_title, "experimental_plot.png", chosen_tokens_str)
+    print(f"{'='*90}\n")
+
+
+# ====================================================================
+# 2. 對照組：標準自回歸 (只 Input 一次 Prompt)
+# ====================================================================
+def run_baseline_standard_generation(model, encode, decode, prompt, max_steps=10):
+    model.eval()
+    target_ids = get_target_ids(encode, TARGET_WORDS)
+    prob_history = {word: [] for word in TARGET_WORDS}
+    
+    # 新增：用來收集每一步選出的字串，供畫圖使用
+    chosen_tokens_str = []
+
+    print(f"\n{'='*90}\n【對照組：標準自回歸生成】(只 Input 一次 Prompt)\n{'='*90}")
+    print(f"原始 Prompt: {prompt}")
+    
+    current_idx = torch.tensor(encode(prompt), dtype=torch.long, device=device).unsqueeze(0)
+    full_generated_tokens = []
+
+    for step in range(max_steps):
+        with torch.no_grad():
+            _, _, all_layers_logits = model(current_idx, return_all_logits=True)
+        
+        print(f"\n[Step {step+1}] 分析當前生成的 Token...")
+        print(f"{'層數':<8} | {'Top 5 Tokens & Probabilities':<50} | {'目標詞機率 (Targets)'}")
+        print("-" * 110)
+        
+        for layer_idx, layer_logits in enumerate(all_layers_logits):
+            logits = layer_logits[:, -1, :] if layer_logits.dim() == 3 else layer_logits[-1, :].unsqueeze(0)
+            probs = F.softmax(logits, dim=-1)
+            top_probs, top_indices = torch.topk(probs[0], 5)
+            
+            top_info = []
+            for p, idx in zip(top_probs, top_indices):
+                token_str = decode([idx.item()]).replace('\n', ' ')
+                top_info.append(f"'{token_str}': {p.item():.4f}")
+                
+            target_probs_str = ", ".join([f"'{k.strip()}': {probs[0, v].item():.4f}" for k, v in target_ids.items()])
+            print(f"L{layer_idx+1:<5} | {', '.join(top_info):<50} | {target_probs_str}")
+            
+            for word, t_id in target_ids.items():
+                prob_history[word].append(probs[0, t_id].item())
+            
+            if layer_idx == 11:
+                next_token_id = top_indices[0].view(1, 1)
+
+        next_chosen_word = decode([next_token_id.item()])
+        current_idx = torch.cat((current_idx, next_token_id), dim=1)
+        full_generated_tokens.append(next_token_id.item())
+        chosen_tokens_str.append(next_chosen_word) # 紀錄該步決策字串
+        
+        print(f"\n>>> 本步輸出: '{next_chosen_word}'")
+
+    print(f"\n[對照組結束] 完整續寫內容: {decode(full_generated_tokens)}")
+    
+    plot_title = "Baseline Group: Target Token Probabilities (Per Layer & Step)"
+    plot_probabilities(prob_history, max_steps, len(all_layers_logits), plot_title, "baseline_plot.png", chosen_tokens_str)
+
+
+# --- A. 載入模型 ---
+print("正在載入模型並配置裝置...")
+model = GPT.from_pretrained('gpt2', dict(dropout=0.0))
+model.to(device)
+
+# --- B. 執行實驗 ---
+# prompt_init = " <System Prompt> You are an assistant. You should respect the retrieved facts 100%. </System Prompt> <Retrieved Facts> \
+# There are three major ways to enhance health: exercise, fasting and sleep. \
+# There are three major ways to enhance health: exercise, sleep and fasting. \
+# There are three major ways to enhance health: fasting, exercise and sleep. \
+# There are three major ways to enhance health: fasting, sleep, and exercise. \
+# There are three major ways to enhance health: sleep, exercise and fasting. \
+# There are three major ways to enhance health: sleep, fasting and exercise. Answer with lowercase english letters. \
+# </Retrieved Facts> What are the three major ways to enhance health? \
+# Answer: the three major ways to enhance health are "
+
+# prompt_init = " <System Prompt> You are an assistant. You should respect the retrieved facts 100%. </System Prompt> <Retrieved Facts> \
+# There are three major ways to enhance health: sleep, fasting and exercise. \
+# </Retrieved Facts> What are the three major ways to enhance health? \
+# Answer: the three major ways to enhance health are "
+
+prompt_init = " <system prompt> you are an assistant. you should respect the retrieved facts 100%. </system Prompt> <retrieved facts> \
+there are three major ways to enhance health: exercise, fasting and sleep. \
+there are three major ways to enhance health: exercise, sleep and fasting. \
+there are three major ways to enhance health: fasting, exercise and sleep. \
+there are three major ways to enhance health: fasting, sleep, and exercise. \
+there are three major ways to enhance health: sleep, exercise and fasting. \
+there are three major ways to enhance health: sleep, fasting and exercise. \
+</retrieved facts> what are the three major ways to enhance health? \
+answer: the three major ways to enhance health are "
+
+
+
+TARGET_WORDS = [" exercise", " sleep", " fasting"]
+
+# 執行對照組
+run_baseline_standard_generation(model, encode, decode, prompt_init, max_steps=10)
+
+# 執行實驗組
+run_step_by_step_interference_study(
+    model=model, encode=encode, decode=decode,
+    initial_prompt=prompt_init,
+    max_steps=10,
+    instruction="" # 測試空指令或加入特定 Instruction
+)

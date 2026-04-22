@@ -68,13 +68,6 @@ traj_ic_margin_target = 0.2
 traj_ic_lambda_dist = 0.5
 traj_ic_teacher_mode = "reference"
 
-roll_teacher_topk = 3
-roll_teacher_horizon = 1
-roll_teacher_temp = 1.0
-traj_ic_lambda_roll = 0.5
-traj_ic_debug_identity = False
-traj_ic_debug_zero_inject = False
-
 config_keys = [k for k, v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read())
 config = {k: globals()[k] for k in config_keys}
@@ -153,12 +146,6 @@ model_args = dict(
     traj_ic_margin_target=traj_ic_margin_target,
     traj_ic_lambda_dist=traj_ic_lambda_dist,
     traj_ic_teacher_mode=traj_ic_teacher_mode,
-    roll_teacher_topk=roll_teacher_topk,
-    roll_teacher_horizon=roll_teacher_horizon,
-    roll_teacher_temp=roll_teacher_temp,
-    traj_ic_lambda_roll=traj_ic_lambda_roll,
-    traj_ic_debug_identity=traj_ic_debug_identity,
-    traj_ic_debug_zero_inject=traj_ic_debug_zero_inject,
 )
 
 if init_from == 'scratch':
@@ -177,9 +164,7 @@ elif init_from == 'resume':
         'n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size',
         'use_traj_ic', 'traj_ic_hidden_dim', 'traj_ic_alpha',
         'traj_ic_lambda_base', 'traj_ic_lambda_ic', 'traj_ic_lambda_traj',
-        'traj_ic_lambda_margin', 'traj_ic_margin_target',
-        'traj_ic_lambda_dist', 'traj_ic_teacher_mode', 'roll_teacher_topk', 'roll_teacher_horizon', 'roll_teacher_temp', 'traj_ic_lambda_roll',
-        'traj_ic_debug_identity', 'traj_ic_debug_zero_inject'
+        'traj_ic_lambda_margin', 'traj_ic_margin_target'
     ]:
         model_args[k] = checkpoint_model_args[k]
     gptconf = GPTConfig(**model_args)
@@ -200,9 +185,7 @@ elif init_from.startswith('gpt2'):
         'n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size',
         'use_traj_ic', 'traj_ic_hidden_dim', 'traj_ic_alpha',
         'traj_ic_lambda_base', 'traj_ic_lambda_ic', 'traj_ic_lambda_traj',
-        'traj_ic_lambda_margin', 'traj_ic_margin_target',
-        'traj_ic_lambda_dist', 'traj_ic_teacher_mode', 'roll_teacher_topk', 'roll_teacher_horizon', 'roll_teacher_temp', 'traj_ic_lambda_roll',
-        'traj_ic_debug_identity', 'traj_ic_debug_zero_inject'
+        'traj_ic_lambda_margin', 'traj_ic_margin_target'
     ]:
         model_args[k] = getattr(model.config, k)
 
@@ -311,18 +294,15 @@ while True:
             stats = raw_model.last_traj_ic_stats
             probes = getattr(raw_model, "last_probe_stats", {})
             if probes:
-                teacher = getattr(raw_model, "last_teacher_stats", {})
                 print(
                     f"iter {iter_num}: loss {lossf:.4f}, "
                     f"base_loss {stats['base_loss']:.4f}, "
                     f"ic_loss {stats['ic_loss']:.4f}, "
                     f"traj_loss {stats['traj_loss']:.4f}, "
                     f"margin_loss {stats['margin_loss']:.4f}, "
-                    f"dist_loss {stats.get('dist_loss', 0.0):.4f}, "
+                    f"dist_loss {stats['dist_loss']:.4f}, "
                     f"delta_u_norm {stats['delta_u_norm']:.4f}, "
                     f"gate_u_mean {stats['gate_u_mean']:.4f}, "
-                    f"teacher_gt {teacher.get('teacher_gt', 0.0):.4f}, "
-                    f"teacher_base {teacher.get('teacher_base', 0.0):.4f}, "
                     f"base_margin {probes['base_margin']:.4f}, "
                     f"ic_margin {probes['ic_margin']:.4f}, "
                     f"margin_gain {probes['margin_gain']:.4f}, "
@@ -337,7 +317,6 @@ while True:
                     f"ic_loss {stats['ic_loss']:.4f}, "
                     f"traj_loss {stats['traj_loss']:.4f}, "
                     f"margin_loss {stats['margin_loss']:.4f}, "
-                    f"roll_dist_loss {stats.get('roll_dist_loss',0.0):.4f}, "
                     f"delta_u_norm {stats['delta_u_norm']:.4f}, "
                     f"gate_u_mean {stats['gate_u_mean']:.4f}, "
                     f"time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%"

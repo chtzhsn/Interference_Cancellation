@@ -138,13 +138,7 @@ class TrajectoryInterferenceEditor(nn.Module):
         )
         self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, h, e_selected, e_unselected, alpha, debug_identity=False):
-        if debug_identity:
-            delta_u = torch.zeros_like(h)
-            gate_u = torch.zeros_like(h)
-            u_ic = h
-            return u_ic, delta_u, gate_u
-
+    def forward(self, h, e_selected, e_unselected, alpha):
         z = torch.cat([h, e_selected, e_unselected], dim=-1)
         delta_u = self.delta_mlp(z)
         gate_u = self.gate(z)
@@ -171,17 +165,6 @@ class GPTConfig:
     traj_ic_lambda_traj: float = 0.0
     traj_ic_lambda_margin: float = 0.5
     traj_ic_margin_target: float = 0.2
-    # distribution-level IC
-    traj_ic_lambda_dist: float = 0.0
-    traj_ic_teacher_mode: str = "reference"
-
-    roll_teacher_topk: int = 3
-    roll_teacher_horizon: int = 2
-    roll_teacher_temp: float = 1.0
-    traj_ic_lambda_roll: float = 0.5
-    # debug / sanity check flags
-    traj_ic_debug_identity: bool = False
-    traj_ic_debug_zero_inject: bool = False
 
 
 class GPT(nn.Module):
@@ -193,7 +176,6 @@ class GPT(nn.Module):
         self.config = config
         self.last_traj_ic_stats = {}
         self.last_probe_stats = {}
-        self.last_teacher_stats = {}
 
         self.transformer = nn.ModuleDict(dict(
             wte=nn.Embedding(config.vocab_size, config.n_embd),
@@ -321,105 +303,6 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
         return x, logits
 
-    def _build_reference_teacher_logits(self, idx, targets):
-        """
-        Build teacher logits by replacing each position's input with the selected token embedding
-        (teacher-forcing), then forward again.
-        """
-        B, T = idx.shape
-
-        # original embeddings
-        tok_emb = self.transformer.wte(idx)
-
-        # replace each position with GT embedding (teacher forcing context edit)
-        e_selected = self.transformer.wte(targets.clamp(min=0))
-
-        # only replace valid positions
-        mask = (targets != -1).unsqueeze(-1)
-        tok_emb_edited = torch.where(mask, e_selected, tok_emb)
-
-        # run transformer
-        pos = torch.arange(0, T, device=idx.device)
-        pos_emb = self.transformer.wpe(pos)
-
-        x = self.transformer.drop(tok_emb_edited + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
-
-        teacher_logits = self.lm_head(x)
-        return teacher_logits
-
-    def _compute_dist_loss(self, ic_logits, teacher_logits):
-        log_probs_ic = F.log_softmax(ic_logits, dim=-1)
-        probs_teacher = F.softmax(teacher_logits, dim=-1)
-
-        return F.kl_div(
-            log_probs_ic,
-            probs_teacher,
-            reduction="batchmean"
-        )
-    
-    def _get_candidate_ids(self, logits, targets):
-        B, T, V = logits.shape
-        K = self.config.roll_teacher_topk
-
-        topk = torch.topk(logits, k=K, dim=-1).indices  # (B,T,K)
-
-        # ensure GT included
-        targets_exp = targets.unsqueeze(-1)
-        topk[:, :, 0] = targets  # force include
-
-        return topk
-
-
-    def _rollout_score(self, idx, targets, anchor_pos, candidate_ids):
-        """
-        Placeholder rollout scorer for future work.
-        Returns zero scores so it has no effect unless explicitly wired into loss.
-        """
-        B, T = idx.shape
-        K = candidate_ids.shape[-1]
-        scores = torch.zeros(B, K, device=idx.device)
-        return scores
-
-    def _build_rollout_teacher(self, idx, targets, base_logits):
-        B, T, V = base_logits.shape
-
-        # pick anchor (last valid token - 1)
-        anchor_pos = T - 2
-
-        candidate_ids = self._get_candidate_ids(base_logits, targets)
-
-        scores = self._rollout_score(idx, targets, anchor_pos, candidate_ids)
-
-        # convert to prob
-        teacher_probs = torch.softmax(-scores / self.config.roll_teacher_temp, dim=-1)
-
-        return teacher_probs, candidate_ids, anchor_pos
-
-
-    def _compute_rollout_dist_loss(self, ic_logits, teacher_probs, candidate_ids, anchor_pos):
-        B, K = teacher_probs.shape
-
-        logits_anchor = ic_logits[:, anchor_pos, :]  # (B,V)
-
-        cand_logits = torch.gather(
-            logits_anchor,
-            dim=-1,
-            index=candidate_ids[:, anchor_pos, :]
-        )  # (B,K)
-
-        student_log_probs = F.log_softmax(cand_logits, dim=-1)
-
-        loss = F.kl_div(
-            student_log_probs,
-            teacher_probs,
-            reduction="batchmean"
-        )
-
-        return loss
-
     def forward(self, idx, targets=None, return_aux=False):
         device = idx.device
         b, t = idx.size()
@@ -448,7 +331,6 @@ class GPT(nn.Module):
                 "gate_u_mean": None,
             }
             self.last_probe_stats = {}
-            self.last_teacher_stats = {}
             if return_aux:
                 return base_logits, base_loss, {}
             return base_logits, base_loss
@@ -461,41 +343,14 @@ class GPT(nn.Module):
         e_unselected = self.transformer.wte(unselected_ids)
 
         u_ic, delta_u, gate_u = self.traj_editor(
-            h_base,
-            e_selected,
-            e_unselected,
-            alpha=self.config.traj_ic_alpha,
-            debug_identity=self.config.traj_ic_debug_identity,
+            h_base, e_selected, e_unselected, alpha=self.config.traj_ic_alpha
         )
 
         injected_state = torch.zeros_like(h_base)
-        if not self.config.traj_ic_debug_zero_inject:
-            injected_state[:, 1:, :] = u_ic[:, :-1, :]  # feed mitigated output at t into t+1
+        injected_state[:, 1:, :] = u_ic[:, :-1, :]  # feed mitigated output at t into t+1
 
         h_ic, ic_logits = self._run_transformer(idx, injected_state=injected_state)
         ic_loss = self._masked_cross_entropy(ic_logits, targets)
-        # ---- teacher distribution ----
-        teacher_logits = self._build_reference_teacher_logits(idx, targets)
-
-        with torch.no_grad():
-            teacher_probs_full = torch.softmax(teacher_logits, dim=-1)
-            teacher_pred = torch.argmax(teacher_probs_full, dim=-1)
-
-            safe_targets = torch.where(valid, targets, torch.zeros_like(targets))
-            teacher_match_gt = (((teacher_pred == safe_targets) & valid).float().sum()
-                                / valid.float().sum().clamp_min(1.0))
-
-            base_pred = torch.argmax(base_logits, dim=-1)
-            teacher_match_base = (((teacher_pred == base_pred) & valid).float().sum()
-                                  / valid.float().sum().clamp_min(1.0))
-
-            self.last_teacher_stats = {
-                "teacher_gt": float(teacher_match_gt.item()),
-                "teacher_base": float(teacher_match_base.item()),
-            }
-
-        # ---- dist loss ----
-        dist_loss = self._compute_dist_loss(ic_logits, teacher_logits)
 
         # simple trajectory consistency surrogate: align next-step hidden state with shifted u_ic
         traj_target = torch.zeros_like(h_base)
@@ -509,7 +364,6 @@ class GPT(nn.Module):
             + self.config.traj_ic_lambda_ic * ic_loss
             + self.config.traj_ic_lambda_traj * traj_loss
             + self.config.traj_ic_lambda_margin * margin_loss
-            + self.config.traj_ic_lambda_dist * dist_loss
         )
 
         delta_u_norm = delta_u.norm(dim=-1).mean()
@@ -522,7 +376,6 @@ class GPT(nn.Module):
             "margin_loss": float(margin_loss.detach().item()),
             "delta_u_norm": float(delta_u_norm.detach().item()),
             "gate_u_mean": float(gate_u_mean.detach().item()),
-            "dist_loss": float(dist_loss.detach().item()),
         }
         self.last_probe_stats = self._compute_probe_stats(base_logits, ic_logits, targets)
 

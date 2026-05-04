@@ -514,20 +514,23 @@ class GPT(nn.Module):
             ic_valid_mask=ic_valid_mask,
             collect_stats=True,
         )
-        gamma = 0.5
+        B, T, V = ic_logits.shape
 
-        valid = targets != -1
-        safe_targets = torch.where(valid, targets, torch.zeros_like(targets))
+        with torch.no_grad():
+            valid = targets != -1
+            safe_targets = torch.where(valid, targets, torch.zeros_like(targets))
+            base_pred = torch.argmax(base_logits, dim=-1)
+            wrong_mask = (base_pred != safe_targets) & valid
 
-        # selected = y
-        z_sel = ic_logits.gather(-1, safe_targets.unsqueeze(-1)).squeeze(-1)
+        per_token_ic_ce = F.cross_entropy(
+            ic_logits.view(-1, V),
+            targets.view(-1),
+            ignore_index=-1,
+            reduction="none",
+        ).view(B, T)
 
-        # unselected = baseline 中排除 y 後最大的 token
-        unselected_current = self._highest_unselected(base_logits, safe_targets)
-        z_unsel = ic_logits.gather(-1, unselected_current.unsqueeze(-1)).squeeze(-1)
-
-        margin_loss = F.relu(gamma - (z_sel - z_unsel))
-        ic_loss = (margin_loss * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
+        denom = wrong_mask.float().sum().clamp_min(1.0)
+        ic_loss = (per_token_ic_ce * wrong_mask.float()).sum() / denom
 
         loss = self.config.ic_lambda_base * base_loss + self.config.ic_lambda_ic * ic_loss
 

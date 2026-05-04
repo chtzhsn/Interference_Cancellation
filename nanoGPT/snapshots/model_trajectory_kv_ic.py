@@ -514,20 +514,7 @@ class GPT(nn.Module):
             ic_valid_mask=ic_valid_mask,
             collect_stats=True,
         )
-        gamma = 0.5
-
-        valid = targets != -1
-        safe_targets = torch.where(valid, targets, torch.zeros_like(targets))
-
-        # selected = y
-        z_sel = ic_logits.gather(-1, safe_targets.unsqueeze(-1)).squeeze(-1)
-
-        # unselected = baseline 中排除 y 後最大的 token
-        unselected_current = self._highest_unselected(base_logits, safe_targets)
-        z_unsel = ic_logits.gather(-1, unselected_current.unsqueeze(-1)).squeeze(-1)
-
-        margin_loss = F.relu(gamma - (z_sel - z_unsel))
-        ic_loss = (margin_loss * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
+        ic_loss = self._ce_loss(ic_logits, targets)
 
         loss = self.config.ic_lambda_base * base_loss + self.config.ic_lambda_ic * ic_loss
 

@@ -1,14 +1,5 @@
 """
-Official nanoGPT train.py with only the clean Interference Cancellation additions.
-
-Supports:
-    --use_ic=True
-    --ic_alpha_k=...
-    --ic_alpha_v=...
-    --ic_lambda_base=...
-    --ic_lambda_ic=...
-
-All other training behavior remains nanoGPT-style.
+Trajectory-level IC training file for nanoGPT.
 """
 
 import os
@@ -65,19 +56,19 @@ device = 'cuda'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
 compile = True
 
-# -----------------------------------------------------------------------------
-# Clean Interference Cancellation config
-use_ic = False
-ic_hidden_dim = 0
-ic_alpha_k = 0.05
-ic_alpha_v = 0.10
-ic_lambda_base = 1.0
-ic_lambda_ic = 1.0
-ic_teacher_forcing = True
-ic_detach_selection = True
-# -----------------------------------------------------------------------------
+# trajectory-level IC
+use_traj_ic = False
+traj_ic_hidden_dim = 0
+traj_ic_alpha = 0.1
+traj_ic_lambda_base = 1.0
+traj_ic_lambda_ic = 0.3
+traj_ic_lambda_traj = 0.0
+traj_ic_lambda_margin = 0.5
+traj_ic_margin_target = 0.2
+traj_ic_lambda_dist = 0.5
+traj_ic_teacher_mode = "reference"
 
-config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
+config_keys = [k for k, v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read())
 config = {k: globals()[k] for k in config_keys}
 # -----------------------------------------------------------------------------
@@ -107,7 +98,6 @@ if master_process:
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-
 device_type = 'cuda' if 'cuda' in device else 'cpu'
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
@@ -146,21 +136,22 @@ model_args = dict(
     bias=bias,
     vocab_size=None,
     dropout=dropout,
-
-    use_ic=use_ic,
-    ic_hidden_dim=ic_hidden_dim,
-    ic_alpha_k=ic_alpha_k,
-    ic_alpha_v=ic_alpha_v,
-    ic_lambda_base=ic_lambda_base,
-    ic_lambda_ic=ic_lambda_ic,
-    ic_teacher_forcing=ic_teacher_forcing,
-    ic_detach_selection=ic_detach_selection,
+    use_traj_ic=use_traj_ic,
+    traj_ic_hidden_dim=traj_ic_hidden_dim,
+    traj_ic_alpha=traj_ic_alpha,
+    traj_ic_lambda_base=traj_ic_lambda_base,
+    traj_ic_lambda_ic=traj_ic_lambda_ic,
+    traj_ic_lambda_traj=traj_ic_lambda_traj,
+    traj_ic_lambda_margin=traj_ic_lambda_margin,
+    traj_ic_margin_target=traj_ic_margin_target,
+    traj_ic_lambda_dist=traj_ic_lambda_dist,
+    traj_ic_teacher_mode=traj_ic_teacher_mode,
 )
 
 if init_from == 'scratch':
     print("Initializing a new model from scratch")
     if meta_vocab_size is None:
-        print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
+        print("defaulting to vocab_size of GPT-2 to 50304")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
@@ -171,16 +162,16 @@ elif init_from == 'resume':
     checkpoint_model_args = checkpoint['model_args']
     for k in [
         'n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size',
-        'use_ic', 'ic_hidden_dim', 'ic_alpha_k', 'ic_alpha_v',
-        'ic_lambda_base', 'ic_lambda_ic', 'ic_teacher_forcing', 'ic_detach_selection',
+        'use_traj_ic', 'traj_ic_hidden_dim', 'traj_ic_alpha',
+        'traj_ic_lambda_base', 'traj_ic_lambda_ic', 'traj_ic_lambda_traj',
+        'traj_ic_lambda_margin', 'traj_ic_margin_target'
     ]:
-        if k in checkpoint_model_args:
-            model_args[k] = checkpoint_model_args[k]
+        model_args[k] = checkpoint_model_args[k]
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
     state_dict = checkpoint['model']
     unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
+    for k, v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
@@ -192,8 +183,9 @@ elif init_from.startswith('gpt2'):
     model = GPT.from_pretrained(init_from, override_args)
     for k in [
         'n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size',
-        'use_ic', 'ic_hidden_dim', 'ic_alpha_k', 'ic_alpha_v',
-        'ic_lambda_base', 'ic_lambda_ic', 'ic_teacher_forcing', 'ic_detach_selection',
+        'use_traj_ic', 'traj_ic_hidden_dim', 'traj_ic_alpha',
+        'traj_ic_lambda_base', 'traj_ic_lambda_ic', 'traj_ic_lambda_traj',
+        'traj_ic_lambda_margin', 'traj_ic_margin_target'
     ]:
         model_args[k] = getattr(model.config, k)
 
@@ -217,6 +209,7 @@ if compile:
 
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model
 
 @torch.no_grad()
 def estimate_loss():
@@ -227,7 +220,7 @@ def estimate_loss():
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                _, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -235,22 +228,16 @@ def estimate_loss():
 
 def get_lr(it):
     if it < warmup_iters:
-        return learning_rate * (it + 1) / (warmup_iters + 1)
+        return learning_rate * it / warmup_iters
     if it > lr_decay_iters:
         return min_lr
     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-    assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (learning_rate - min_lr)
-
-if wandb_log and master_process:
-    import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 X, Y = get_batch('train')
 t0 = time.time()
 local_iter_num = 0
-raw_model = model.module if ddp else model
 running_mfu = -1.0
 
 while True:
@@ -261,14 +248,6 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        if wandb_log:
-            wandb.log({
-                "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr,
-                "mfu": running_mfu*100,
-            })
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -282,7 +261,6 @@ while True:
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
-
     if iter_num == 0 and eval_only:
         break
 
@@ -290,7 +268,7 @@ while True:
         if ddp:
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            _, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps
         X, Y = get_batch('train')
         scaler.scale(loss).backward()
@@ -298,7 +276,6 @@ while True:
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-
     scaler.step(optimizer)
     scaler.update()
     optimizer.zero_grad(set_to_none=True)
@@ -311,22 +288,39 @@ while True:
         lossf = loss.item() * gradient_accumulation_steps
         if local_iter_num >= 5:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+            running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
 
-        if use_ic and getattr(raw_model, "last_ic_stats", None):
-            s = raw_model.last_ic_stats
-            print(
-                f"iter {iter_num}: loss {lossf:.4f}, "
-                f"base_loss {s.get('base_loss', 0):.4f}, "
-                f"ic_loss {s.get('ic_loss', 0):.4f}, "
-                f"delta_k_norm {s.get('delta_k_norm', 0):.4f}, "
-                f"delta_v_norm {s.get('delta_v_norm', 0):.4f}, "
-                f"gate_k_mean {s.get('gate_k_mean', 0):.4f}, "
-                f"gate_v_mean {s.get('gate_v_mean', 0):.4f}, "
-                f"base_top1 {s.get('base_top1', 0):.4f}, "
-                f"ic_top1 {s.get('ic_top1', 0):.4f}, "
-                f"time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%"
-            )
+        if use_traj_ic and getattr(raw_model, "last_traj_ic_stats", None):
+            stats = raw_model.last_traj_ic_stats
+            probes = getattr(raw_model, "last_probe_stats", {})
+            if probes:
+                print(
+                    f"iter {iter_num}: loss {lossf:.4f}, "
+                    f"base_loss {stats['base_loss']:.4f}, "
+                    f"ic_loss {stats['ic_loss']:.4f}, "
+                    f"traj_loss {stats['traj_loss']:.4f}, "
+                    f"margin_loss {stats['margin_loss']:.4f}, "
+                    f"dist_loss {stats['dist_loss']:.4f}, "
+                    f"delta_u_norm {stats['delta_u_norm']:.4f}, "
+                    f"gate_u_mean {stats['gate_u_mean']:.4f}, "
+                    f"base_margin {probes['base_margin']:.4f}, "
+                    f"ic_margin {probes['ic_margin']:.4f}, "
+                    f"margin_gain {probes['margin_gain']:.4f}, "
+                    f"base_top1 {probes['base_top1_acc']:.4f}, "
+                    f"ic_top1 {probes['ic_top1_acc']:.4f}, "
+                    f"time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%"
+                )
+            else:
+                print(
+                    f"iter {iter_num}: loss {lossf:.4f}, "
+                    f"base_loss {stats['base_loss']:.4f}, "
+                    f"ic_loss {stats['ic_loss']:.4f}, "
+                    f"traj_loss {stats['traj_loss']:.4f}, "
+                    f"margin_loss {stats['margin_loss']:.4f}, "
+                    f"delta_u_norm {stats['delta_u_norm']:.4f}, "
+                    f"gate_u_mean {stats['gate_u_mean']:.4f}, "
+                    f"time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%"
+                )
         else:
             print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
 

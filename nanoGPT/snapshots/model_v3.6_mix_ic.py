@@ -1,7 +1,7 @@
 """
 Clean nanoGPT Interference Cancellation model.py
 
-Trajectory-wide V-only IC version.
+Trajectory-wide KV IC version.
 
 This version implements the intended mechanism:
 
@@ -16,7 +16,7 @@ For the next query position q=t+1:
 Therefore, for query position q:
     decision used = q-1
     editable source positions = s < q
-    K_s(q) is kept original, while V'_s(q) = IC(V_s, K_s, Emb(x_sel(q-1)), Emb(x_unsel(q-1)))
+    K'_s(q), V'_s(q) = IC(K_s, V_s, Emb(x_sel(q-1)), Emb(x_unsel(q-1)))
 
 When use_ic=False, behavior is the original nanoGPT behavior.
 """
@@ -102,14 +102,13 @@ class InterferenceCancellationKV(nn.Module):
 
         z = torch.cat([k_pair_base, v_pair_base, e_sel_pair, e_unsel_pair], dim=-1)
 
-        # V-only IC:
-        # We still build z using [K,V,e_sel,e_unsel], but only V is edited.
-        # K is kept exactly equal to the original K.
+        delta_k = self.k_mlp(z)
         delta_v = self.v_mlp(z)
+        gate_k = self.k_gate(z)
         gate_v = self.v_gate(z)
 
         # Only edit source positions s < q.
-        # This implements: decision at t=q-1 edits V_{1:t}, while K_{1:t} stays original.
+        # This implements: decision at t=q-1 edits K_{1:t}, V_{1:t}.
         src_pos = torch.arange(T, device=device).view(1, 1, T)
         qry_pos = torch.arange(T, device=device).view(1, T, 1)
         causal_edit_mask = src_pos < qry_pos  # (1,Tq,Ts)
@@ -120,50 +119,20 @@ class InterferenceCancellationKV(nn.Module):
         else:
             edit_mask = causal_edit_mask.expand(B, T, T)
 
-        m = edit_mask.to(delta_v.dtype).unsqueeze(-1)
-
-        # ===== K-only IC =====
-
-        delta_k = self.k_mlp(z)
-        gate_k = self.k_gate(z)
-
-        # causal mask（你原本就有）
-        src_pos = torch.arange(T, device=device).view(1, 1, T)
-        qry_pos = torch.arange(T, device=device).view(1, T, 1)
-        causal_edit_mask = src_pos < qry_pos
-
-        if ic_valid_mask is not None:
-            valid_q = ic_valid_mask.view(B, T, 1)
-            edit_mask = causal_edit_mask & valid_q
-        else:
-            edit_mask = causal_edit_mask.expand(B, T, T)
-
         m = edit_mask.to(delta_k.dtype).unsqueeze(-1)
 
         delta_k = delta_k * m
+        delta_v = delta_v * m
         gate_k = gate_k * m
+        gate_v = gate_v * m
 
-        # ⭐ K 改、V 不動
         k_pair = k_pair_base + alpha_k * self.dropout(gate_k * delta_k)
-        v_pair = v_pair_base
+        v_pair = v_pair_base + alpha_v * self.dropout(gate_v * delta_v)
 
-        # logging（保持一致）
-        zero = delta_k.new_tensor(0.0)
         stats = {
             "delta_k_norm": delta_k.norm(dim=-1).mean(),
-            "delta_v_norm": zero,
-            "gate_k_mean": gate_k.mean(),
-            "gate_v_mean": zero,
-        }
-
-        return k_pair, v_pair, stats
-
-        # For logging compatibility, report delta_k_norm = 0 and gate_k_mean = 0.
-        zero = delta_v.new_tensor(0.0)
-        stats = {
-            "delta_k_norm": zero,
             "delta_v_norm": delta_v.norm(dim=-1).mean(),
-            "gate_k_mean": zero,
+            "gate_k_mean": gate_k.mean(),
             "gate_v_mean": gate_v.mean(),
         }
         return k_pair, v_pair, stats
@@ -545,16 +514,30 @@ class GPT(nn.Module):
             ic_valid_mask=ic_valid_mask,
             collect_stats=True,
         )
-        # ===== V-only IC loss =====
-        # Pure IC CE loss:
-        #     L = lambda_base * CE(z_base, y) + lambda_ic * CE(z_IC, y)
-        #
-        # For IC-only V-only experiments, run with:
-        #     --ic_lambda_base=0.0 --ic_lambda_ic=1.0
-        ic_loss = self._ce_loss(ic_logits, targets)
 
+        
+        gamma = 0.5
+        lambda_margin = 0.3   # ⭐ 可以之後調
+
+        valid = targets != -1
+        safe_targets = torch.where(valid, targets, torch.zeros_like(targets))
+
+        # selected = y
+        ce_loss = self._ce_loss(ic_logits, targets)
+        z_sel = ic_logits.gather(-1, safe_targets.unsqueeze(-1)).squeeze(-1)
+
+        # unselected = baseline 中排除 y 後最大的 token
+        unselected_current = self._highest_unselected(base_logits, safe_targets)
+        z_unsel = ic_logits.gather(-1, unselected_current.unsqueeze(-1)).squeeze(-1)
+
+        margin = F.relu(gamma - (z_sel - z_unsel))
+        margin_loss = (margin * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
+        # margin_loss = F.relu(gamma - (z_sel - z_unsel))
+        # ic_loss = (margin_loss * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
+        ic_loss = ce_loss + lambda_margin * margin_loss
         loss = self.config.ic_lambda_base * base_loss + self.config.ic_lambda_ic * ic_loss
-
+        
+        self.last_ic_stats["margin_loss"] = float(margin_loss.detach().item())
         self._record_ic_stats(stats_list, base_logits, ic_logits, base_loss, ic_loss, targets)
 
         return ic_logits, loss

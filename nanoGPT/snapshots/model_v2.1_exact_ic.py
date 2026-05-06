@@ -1,22 +1,20 @@
 """
 Clean nanoGPT Interference Cancellation model.py
 
-Trajectory-wide V-only IC version.
+This version starts from official nanoGPT model.py and implements exactly:
 
-This version implements the intended mechanism:
+At position t:
+    x_sel(t-1)   = token selected/output at time t-1
+    x_unsel(t-1) = argmax over all tokens except x_sel(t-1), according to logits at t-1
 
-At decision time t:
-    x_sel(t)   = token selected/output at time t
-    x_unsel(t) = argmax over all tokens except x_sel(t), according to logits at t
+Then:
+    K_ic(t), V_ic(t) = IC(K_t, V_t, Emb(x_sel(t-1)), Emb(x_unsel(t-1)))
+    Attention(Q_t, K_ic, V_ic)
 
-For the next query position q=t+1:
-    the previous decision signal (x_sel(t), x_unsel(t)) edits the whole previous KV cache K_{1:t}, V_{1:t}
-    before attention at q is computed.
-
-Therefore, for query position q:
-    decision used = q-1
-    editable source positions = s < q
-    K_s(q) is kept original, while V'_s(q) = IC(V_s, K_s, Emb(x_sel(q-1)), Emb(x_unsel(q-1)))
+Training:
+    selected token = target token under teacher forcing
+    unselected token = highest-logit token excluding selected token
+    position t uses selected/unselected from t-1
 
 When use_ic=False, behavior is the original nanoGPT behavior.
 """
@@ -44,17 +42,17 @@ class LayerNorm(nn.Module):
 
 class InterferenceCancellationKV(nn.Module):
     """
-    Query-dependent trajectory-wide KV editor.
-
-    For each query position q, use the decision at q-1 to edit all source positions s < q.
+    Learn K_ic and V_ic from current K,V and previous selected/unselected token embeddings.
 
     Inputs:
-        k_full, v_full:           (B, T, C)
-        e_sel_prev, e_unsel_prev: (B, T, C), where index q stores decision at q-1
-        ic_valid_mask:            (B, T), True if q has a valid previous decision
+        k_full:        (B,T,C)
+        v_full:        (B,T,C)
+        e_sel_prev:    (B,T,C)
+        e_unsel_prev:  (B,T,C)
+        ic_valid_mask: (B,T), True if previous decision exists
 
-    Outputs:
-        k_pair, v_pair:           (B, T_query, T_source, C)
+    Output:
+        k_ic, v_ic:    (B,T,C)
     """
 
     def __init__(self, config):
@@ -83,90 +81,30 @@ class InterferenceCancellationKV(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, k_full, v_full, e_sel_prev, e_unsel_prev, alpha_k, alpha_v, ic_valid_mask=None):
-        B, T, C = k_full.shape
-        device = k_full.device
-
-        # Source-wise K,V: (B, 1, T_source, C)
-        k_src = k_full.unsqueeze(1)
-        v_src = v_full.unsqueeze(1)
-
-        # Query-wise previous-decision embeddings: (B, T_query, 1, C)
-        e_sel_q = e_sel_prev.unsqueeze(2)
-        e_unsel_q = e_unsel_prev.unsqueeze(2)
-
-        # Pairwise query-source tensors: (B, T_query, T_source, C)
-        k_pair_base = k_src.expand(B, T, T, C)
-        v_pair_base = v_src.expand(B, T, T, C)
-        e_sel_pair = e_sel_q.expand(B, T, T, C)
-        e_unsel_pair = e_unsel_q.expand(B, T, T, C)
-
-        z = torch.cat([k_pair_base, v_pair_base, e_sel_pair, e_unsel_pair], dim=-1)
-
-        # V-only IC:
-        # We still build z using [K,V,e_sel,e_unsel], but only V is edited.
-        # K is kept exactly equal to the original K.
-        delta_v = self.v_mlp(z)
-        gate_v = self.v_gate(z)
-
-        # Only edit source positions s < q.
-        # This implements: decision at t=q-1 edits V_{1:t}, while K_{1:t} stays original.
-        src_pos = torch.arange(T, device=device).view(1, 1, T)
-        qry_pos = torch.arange(T, device=device).view(1, T, 1)
-        causal_edit_mask = src_pos < qry_pos  # (1,Tq,Ts)
-
-        if ic_valid_mask is not None:
-            valid_q = ic_valid_mask.view(B, T, 1)
-            edit_mask = causal_edit_mask & valid_q
-        else:
-            edit_mask = causal_edit_mask.expand(B, T, T)
-
-        m = edit_mask.to(delta_v.dtype).unsqueeze(-1)
-
-        # ===== K-only IC =====
+        z = torch.cat([k_full, v_full, e_sel_prev, e_unsel_prev], dim=-1)
 
         delta_k = self.k_mlp(z)
+        delta_v = self.v_mlp(z)
         gate_k = self.k_gate(z)
-
-        # causal mask（你原本就有）
-        src_pos = torch.arange(T, device=device).view(1, 1, T)
-        qry_pos = torch.arange(T, device=device).view(1, T, 1)
-        causal_edit_mask = src_pos < qry_pos
+        gate_v = self.v_gate(z)
 
         if ic_valid_mask is not None:
-            valid_q = ic_valid_mask.view(B, T, 1)
-            edit_mask = causal_edit_mask & valid_q
-        else:
-            edit_mask = causal_edit_mask.expand(B, T, T)
+            m = ic_valid_mask.to(delta_k.dtype).unsqueeze(-1)
+            delta_k = delta_k * m
+            delta_v = delta_v * m
+            gate_k = gate_k * m
+            gate_v = gate_v * m
 
-        m = edit_mask.to(delta_k.dtype).unsqueeze(-1)
+        k_ic = k_full + alpha_k * self.dropout(gate_k * delta_k)
+        v_ic = v_full + alpha_v * self.dropout(gate_v * delta_v)
 
-        delta_k = delta_k * m
-        gate_k = gate_k * m
-
-        # ⭐ K 改、V 不動
-        k_pair = k_pair_base + alpha_k * self.dropout(gate_k * delta_k)
-        v_pair = v_pair_base
-
-        # logging（保持一致）
-        zero = delta_k.new_tensor(0.0)
         stats = {
             "delta_k_norm": delta_k.norm(dim=-1).mean(),
-            "delta_v_norm": zero,
-            "gate_k_mean": gate_k.mean(),
-            "gate_v_mean": zero,
-        }
-
-        return k_pair, v_pair, stats
-
-        # For logging compatibility, report delta_k_norm = 0 and gate_k_mean = 0.
-        zero = delta_v.new_tensor(0.0)
-        stats = {
-            "delta_k_norm": zero,
             "delta_v_norm": delta_v.norm(dim=-1).mean(),
-            "gate_k_mean": zero,
+            "gate_k_mean": gate_k.mean(),
             "gate_v_mean": gate_v.mean(),
         }
-        return k_pair, v_pair, stats
+        return k_ic, v_ic, stats
 
 
 class CausalSelfAttention(nn.Module):
@@ -193,33 +131,26 @@ class CausalSelfAttention(nn.Module):
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-        self.register_buffer(
-            "bias",
-            torch.tril(torch.ones(config.block_size, config.block_size)).view(
-                1, 1, config.block_size, config.block_size
-            ),
-        )
+            self.register_buffer(
+                "bias",
+                torch.tril(torch.ones(config.block_size, config.block_size)).view(
+                    1, 1, config.block_size, config.block_size
+                ),
+            )
 
     def _to_heads(self, x, B, T, C):
         return x.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-
-    def _pair_to_heads(self, x_pair, B, T, C):
-        # (B,Tq,Ts,C) -> (B,nh,Tq,Ts,hs)
-        hs = C // self.n_head
-        return x_pair.view(B, T, T, self.n_head, hs).permute(0, 3, 1, 2, 4)
 
     def forward(self, x, e_sel_prev=None, e_unsel_prev=None, ic_valid_mask=None, return_ic_stats=False):
         B, T, C = x.size()
 
         q_full, k_full, v_full = self.c_attn(x).split(self.n_embd, dim=2)
-        q = self._to_heads(q_full, B, T, C)
 
         ic_stats = None
         use_ic_now = self.use_ic and (e_sel_prev is not None) and (e_unsel_prev is not None)
 
         if use_ic_now:
-            # Query-dependent trajectory-wide edited K/V.
-            k_pair, v_pair, ic_stats = self.ic_module(
+            k_full, v_full, ic_stats = self.ic_module(
                 k_full,
                 v_full,
                 e_sel_prev,
@@ -229,38 +160,25 @@ class CausalSelfAttention(nn.Module):
                 ic_valid_mask=ic_valid_mask,
             )
 
-            k_pair_h = self._pair_to_heads(k_pair, B, T, C)  # (B,nh,Tq,Ts,hs)
-            v_pair_h = self._pair_to_heads(v_pair, B, T, C)  # (B,nh,Tq,Ts,hs)
+        q = self._to_heads(q_full, B, T, C)
+        k = self._to_heads(k_full, B, T, C)
+        v = self._to_heads(v_full, B, T, C)
 
-            # q: (B,nh,Tq,hs); result: (B,nh,Tq,Ts)
-            att = (q.unsqueeze(3) * k_pair_h).sum(dim=-1) * (1.0 / math.sqrt(k_pair_h.size(-1)))
-
-            # Standard causal attention: source s <= query q.
+        if self.flash:
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                dropout_p=self.dropout if self.training else 0,
+                is_causal=True,
+            )
+        else:
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-
-            y = (att.unsqueeze(-1) * v_pair_h).sum(dim=3)  # (B,nh,Tq,hs)
-
-        else:
-            k = self._to_heads(k_full, B, T, C)
-            v = self._to_heads(v_full, B, T, C)
-
-            if self.flash:
-                y = torch.nn.functional.scaled_dot_product_attention(
-                    q,
-                    k,
-                    v,
-                    attn_mask=None,
-                    dropout_p=self.dropout if self.training else 0,
-                    is_causal=True,
-                )
-            else:
-                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-                att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-                att = F.softmax(att, dim=-1)
-                att = self.attn_dropout(att)
-                y = att @ v
+            y = att @ v
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
@@ -537,7 +455,7 @@ class GPT(nn.Module):
             targets=targets,
         )
 
-        # 3. IC pass. For query q, decision q-1 edits all previous source KV K_{1:q-1}, V_{1:q-1}.
+        # 3. IC pass. At position t, K_t,V_t are edited by selected/unselected from t-1.
         ic_logits, stats_list = self._run_transformer(
             idx,
             selected_prev=selected_prev,
@@ -545,12 +463,6 @@ class GPT(nn.Module):
             ic_valid_mask=ic_valid_mask,
             collect_stats=True,
         )
-        # ===== V-only IC loss =====
-        # Pure IC CE loss:
-        #     L = lambda_base * CE(z_base, y) + lambda_ic * CE(z_IC, y)
-        #
-        # For IC-only V-only experiments, run with:
-        #     --ic_lambda_base=0.0 --ic_lambda_ic=1.0
         ic_loss = self._ce_loss(ic_logits, targets)
 
         loss = self.config.ic_lambda_base * base_loss + self.config.ic_lambda_ic * ic_loss

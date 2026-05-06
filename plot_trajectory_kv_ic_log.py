@@ -24,8 +24,17 @@ import matplotlib.pyplot as plt
 # LOG_PATH = Path("logs/v3.4_traj_condi_ic.txt")
 # OUT_DIR = Path("plots/v3.4_traj_condi_ic")
 
-LOG_PATH = Path("logs/v3.5_traj_margin_ic.txt")
-OUT_DIR = Path("plots/v3.5_traj_margin_ic")
+# LOG_PATH = Path("logs/v3.5_traj_margin_ic.txt")
+# OUT_DIR = Path("plots/v3.5_traj_margin_ic")
+
+# LOG_PATH = Path("logs/v3.6_traj_mix_ic.txt")
+# OUT_DIR = Path("plots/v3.6_traj_mix_ic")
+
+# LOG_PATH = Path("logs/v3.7_traj_v_only_ic.txt")
+# OUT_DIR = Path("plots/v3.7_traj_v_only_Lic_only")
+
+LOG_PATH = Path("logs/v3.8_traj_k_only_ic.txt")
+OUT_DIR = Path("plots/v3.8_traj_k_only_Lic_only")
 
 ITER_RE = re.compile(
     r"iter\s+(?P<iter>\d+):\s+loss\s+(?P<loss>[-+]?\d*\.?\d+),\s+"

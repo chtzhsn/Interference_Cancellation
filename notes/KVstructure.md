@@ -244,3 +244,181 @@ At time t:
 > We move interference cancellation from hidden-state perturbation to KV cache rewriting after token selection, enabling hindsight to directly influence future attention and generation.
 
 ---
+Training Structure
+```
+INPUT: x_0, x_1, ..., x_T
+        │
+        ▼
+==============================
+PASS 1 (Baseline branch)
+==============================
+        │
+        ▼
+[Embedding + Position]
+        │
+        ▼
+[Transformer Blocks]
+        │
+        ▼
+z_base (logits)
+        │
+        ├──► 用來算 base_loss
+        │
+        └──► 用來產生：
+                x_sel(t)   = y_t
+                x_unsel(t) = argmax_{j≠y_t} z_base
+        │
+        ▼
+==============================
+PASS 2 (IC branch)
+==============================
+        │
+        ▼
+[Embedding + Position]
+        │
+        ▼
+[Transformer Blocks + KV IC]
+        │
+        ▼
+z_IC (logits)
+        │
+        ├──► 用來算 ic_loss
+        │
+        └──► 用來算 ic accuracy（你畫圖用的）
+        
+==============================
+FINAL OUTPUT（training）
+==============================
+loss = L_base + L_IC   或其他版本
+
+TRANSFORMER BLOCK:
+for each block ℓ:
+
+    input: h_1 ... h_T
+        │
+        ▼
+    [LayerNorm]
+        │
+        ▼
+    [Linear → Q, K, V]
+        │
+        ▼
+    ┌───────────────────────────────┐
+    │  IC Module (只在 PASS 2)       │
+    │                               │
+    │  for each query q:            │
+    │      取 (q-1) 的 decision     │
+    │      │                        │
+    │      ├─ e_sel(q-1)            │
+    │      └─ e_unsel(q-1)          │
+    │                               │
+    │      for each s < q:          │
+    │          [K_s, V_s, e_sel, e_unsel]
+    │                │
+    │                ▼
+    │          ΔK, ΔV (MLP)
+    │                │
+    │                ▼
+    │          gate g_K, g_V
+    │                │
+    │                ▼
+    │          K_IC(q,s)
+    │          V_IC(q,s)
+    │
+    │      s = q → 不改
+    └───────────────────────────────┘
+        │
+        ▼
+    [Attention]
+        │
+        ▼
+    output o_q
+        │
+        ▼
+    [Residual]
+        │
+        ▼
+    [MLP]
+        │
+        ▼
+    [Residual]
+        │
+        ▼
+    h_q^ℓ
+
+TRAINING IC                  vs        TRUE IC INFERENCE
+------------------------------------------------------------
+一次吃整段 sequence           一步一步生成 token
+
+z_base / z_IC 被比較          z 決定 token
+
+token = y_t                  token = argmax(z)
+
+KV 是 "每個 query 重算"        KV 是 "真的被覆寫"
+
+沒有記憶累積                 有 persistent memory
+
+IC 不影響輸出                IC 直接控制輸出
+```
+
+Inference structure
+```
+            (一步一步生成)
+
+t = 0
+---------------------------------
+input: x_0
+    │
+    ▼
+Transformer
+    │
+    ▼
+z_0
+    │
+    ▼
+x_0^* = argmax(z_0)   ← 真正決定 token
+    │
+    ▼
+用 (x_sel^0, x_unsel^0) 改 KV
+(K_0 → K_0')
+
+---------------------------------
+
+t = 1
+---------------------------------
+input: x_0^*, x_1
+    │
+    ▼
+Transformer (用 K_0')
+    │
+    ▼
+z_1
+    │
+    ▼
+x_1^* = argmax(z_1)
+    │
+    ▼
+更新 KV:
+K_0' → K_0''
+K_1  → K_1'
+
+---------------------------------
+
+t = 2
+---------------------------------
+input: x_0^*, x_1^*, x_2
+    │
+    ▼
+Transformer (用 K_0'', K_1')
+    │
+    ▼
+z_2
+    │
+    ▼
+x_2^* = argmax(z_2)
+    │
+    ▼
+持續更新 KV
+```
+
+

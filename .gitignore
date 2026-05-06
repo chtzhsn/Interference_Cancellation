@@ -11,11 +11,11 @@ venv_nano/
 data/
 *.txt
 
-# logs / outputs
-logs/*
-plots/*
-!logs/.keep
-!plots/.keep
+# # logs / outputs
+# logs/*
+# plots/*
+# !logs/.keep
+# !plots/.keep
 
 # checkpoints
 *.pt

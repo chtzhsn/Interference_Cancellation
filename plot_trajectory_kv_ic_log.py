@@ -33,8 +33,11 @@ import matplotlib.pyplot as plt
 # LOG_PATH = Path("logs/v3.7_traj_v_only_ic.txt")
 # OUT_DIR = Path("plots/v3.7_traj_v_only_Lic_only")
 
-LOG_PATH = Path("logs/v3.8_traj_k_only_ic.txt")
-OUT_DIR = Path("plots/v3.8_traj_k_only_Lic_only")
+# LOG_PATH = Path("logs/v3.8_traj_k_only_ic.txt")
+# OUT_DIR = Path("plots/v3.8_traj_k_only_Lic_only")
+
+LOG_PATH = Path("logs/v3.9_v_only_conf_bucket.txt")
+OUT_DIR = Path("plots/v3.9_v_only_conf_bucket")
 
 ITER_RE = re.compile(
     r"iter\s+(?P<iter>\d+):\s+loss\s+(?P<loss>[-+]?\d*\.?\d+),\s+"

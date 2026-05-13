@@ -127,7 +127,7 @@ class InterferenceCancellationKV(nn.Module):
         gate_v = gate_v * m
 
         k_pair = k_pair_base + alpha_k * self.dropout(gate_k * delta_k)
-        v_pair = v_pair_base # + alpha_v * self.dropout(gate_v * delta_v)
+        v_pair = v_pair_base + alpha_v * self.dropout(gate_v * delta_v)
 
         stats = {
             "delta_k_norm": delta_k.norm(dim=-1).mean(),

@@ -1,7 +1,7 @@
 """
 Clean nanoGPT Interference Cancellation model.py
 
-Trajectory-wide KV IC version.
+Trajectory-wide V-only IC version.
 
 This version implements the intended mechanism:
 
@@ -16,7 +16,7 @@ For the next query position q=t+1:
 Therefore, for query position q:
     decision used = q-1
     editable source positions = s < q
-    K'_s(q), V'_s(q) = IC(K_s, V_s, Emb(x_sel(q-1)), Emb(x_unsel(q-1)))
+    K_s(q) is kept original, while V'_s(q) = IC(V_s, K_s, Emb(x_sel(q-1)), Emb(x_unsel(q-1)))
 
 When use_ic=False, behavior is the original nanoGPT behavior.
 """
@@ -102,13 +102,14 @@ class InterferenceCancellationKV(nn.Module):
 
         z = torch.cat([k_pair_base, v_pair_base, e_sel_pair, e_unsel_pair], dim=-1)
 
-        delta_k = self.k_mlp(z)
+        # V-only IC:
+        # We still build z using [K,V,e_sel,e_unsel], but only V is edited.
+        # K is kept exactly equal to the original K.
         delta_v = self.v_mlp(z)
-        gate_k = self.k_gate(z)
         gate_v = self.v_gate(z)
 
         # Only edit source positions s < q.
-        # This implements: decision at t=q-1 edits K_{1:t}, V_{1:t}.
+        # This implements: decision at t=q-1 edits V_{1:t}, while K_{1:t} stays original.
         src_pos = torch.arange(T, device=device).view(1, 1, T)
         qry_pos = torch.arange(T, device=device).view(1, T, 1)
         causal_edit_mask = src_pos < qry_pos  # (1,Tq,Ts)
@@ -119,20 +120,21 @@ class InterferenceCancellationKV(nn.Module):
         else:
             edit_mask = causal_edit_mask.expand(B, T, T)
 
-        m = edit_mask.to(delta_k.dtype).unsqueeze(-1)
+        m = edit_mask.to(delta_v.dtype).unsqueeze(-1)
 
-        delta_k = delta_k * m
         delta_v = delta_v * m
-        gate_k = gate_k * m
         gate_v = gate_v * m
 
-        k_pair = k_pair_base + alpha_k * self.dropout(gate_k * delta_k)
-        v_pair = v_pair_base # + alpha_v * self.dropout(gate_v * delta_v)
+        # K is not edited in this ablation.
+        k_pair = k_pair_base
+        v_pair = v_pair_base + alpha_v * self.dropout(gate_v * delta_v)
 
+        # For logging compatibility, report delta_k_norm = 0 and gate_k_mean = 0.
+        zero = delta_v.new_tensor(0.0)
         stats = {
-            "delta_k_norm": delta_k.norm(dim=-1).mean(),
+            "delta_k_norm": zero,
             "delta_v_norm": delta_v.norm(dim=-1).mean(),
-            "gate_k_mean": gate_k.mean(),
+            "gate_k_mean": zero,
             "gate_v_mean": gate_v.mean(),
         }
         return k_pair, v_pair, stats
@@ -558,11 +560,11 @@ class GPT(nn.Module):
             ic_valid_mask=ic_valid_mask,
             collect_stats=True,
         )
-        # ===== K+V IC loss =====
+        # ===== V-only IC loss =====
         # Pure IC CE loss:
         #     L = lambda_base * CE(z_base, y) + lambda_ic * CE(z_IC, y)
         #
-        # For IC-only K+V experiments, run with:
+        # For IC-only V-only experiments, run with:
         #     --ic_lambda_base=0.0 --ic_lambda_ic=1.0
         ic_loss = self._ce_loss(ic_logits, targets)
 

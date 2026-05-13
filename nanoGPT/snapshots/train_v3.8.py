@@ -325,12 +325,6 @@ while True:
                 f"gate_v_mean {s.get('gate_v_mean', 0):.4f}, "
                 f"base_top1 {s.get('base_top1', 0):.4f}, "
                 f"ic_top1 {s.get('ic_top1', 0):.4f}, "
-                f"high_n {s.get('high_count', 0):.0f}, "
-                f"high_delta {s.get('high_delta', 0):.4f}, "
-                f"med_n {s.get('med_count', 0):.0f}, "
-                f"med_delta {s.get('med_delta', 0):.4f}, "
-                f"low_n {s.get('low_count', 0):.0f}, "
-                f"low_delta {s.get('low_delta', 0):.4f}, "
                 f"time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%"
             )
         else:
